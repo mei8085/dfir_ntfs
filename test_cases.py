@@ -13,6 +13,7 @@ import io
 import gzip
 import tarfile
 import pickle
+import struct
 from dfir_ntfs import MFT, WSL, USN, Attributes, LogFile, BootSector, ShadowCopy, PartitionTable, MoveTable
 from dfir_ntfs.addons import FAT, exFAT
 
@@ -5261,3 +5262,398 @@ def test_fat_64bit_sector_count():
 	assert warn_cnt == 1
 
 	FAT.WARN_FUNC = warn_old
+
+# --- Volume header parsing and file record location consistency -------------------------------
+#
+# The byte offset of every file record segment (FRS) in a volume image is constrained jointly by
+# four boot-sector fields: the sector size, the cluster size, the FRS size and the starting
+# clusters of $MFT and $MFTMirr. Decoding any single field correctly is not enough: reading a
+# plausible "FILE" signature from the wrong offset must never be accepted as evidence.
+# The tests below build (or mutate) complete volume images in memory and cross-check the offsets,
+# strides and spans of $MFT, $MFTMirr and adjacent records against one another.
+
+def _volume_geometry(bs):
+	"""Return the (sector_size, cluster_size, frs_size, mft_byte_offset, mirror_byte_offset) tuple derived from a boot sector."""
+
+	sector_size = bs.get_bytes_per_sector()
+	cluster_size = bs.get_sectors_per_cluster() * sector_size
+	frs_size = bs.get_file_record_segment_size()
+	mft_offset = bs.get_first_mft_cluster() * cluster_size
+	mirror_offset = bs.get_first_mftmirr_cluster() * cluster_size
+
+	return (sector_size, cluster_size, frs_size, mft_offset, mirror_offset)
+
+def _build_relocated_volume(raw, cluster_size, old_mft_cluster, old_second_cluster, new_mft_cluster, new_second_cluster, mirror_cluster):
+	"""Build a self-consistent volume image whose $MFT was relocated.
+	The pristine first extent (4 clusters) and second extent (60 clusters) are copied to free clusters,
+	the mapping pairs of record 0 (and of its $MFTMirr copy) are rewritten, the boot sector points at
+	the new location and the old first FRS location is turned into a structurally invalid decoy.
+	"""
+
+	image = bytearray(raw)
+
+	# The destination clusters must be unused (a zeroed cluster starts with null bytes).
+	for c in range(new_mft_cluster, new_mft_cluster + 4):
+		assert image[c * cluster_size : c * cluster_size + 4] == b'\x00\x00\x00\x00'
+
+	for c in range(new_second_cluster, new_second_cluster + 60):
+		assert image[c * cluster_size : c * cluster_size + 4] == b'\x00\x00\x00\x00'
+
+	image[new_mft_cluster * cluster_size : (new_mft_cluster + 4) * cluster_size] = image[old_mft_cluster * cluster_size : (old_mft_cluster + 4) * cluster_size]
+	image[new_second_cluster * cluster_size : (new_second_cluster + 60) * cluster_size] = image[old_second_cluster * cluster_size : (old_second_cluster + 60) * cluster_size]
+
+	# Both runs use a header byte of 0x21 (one cluster-count byte, two signed offset bytes).
+	delta = new_second_cluster - new_mft_cluster
+	new_mapping_pairs = b'\x21' + bytes([4]) + new_mft_cluster.to_bytes(2, byteorder = 'little')
+	new_mapping_pairs += b'\x21' + bytes([60]) + delta.to_bytes(2, byteorder = 'little', signed = True) + b'\x00'
+
+	assert MFT.DecodeMappingPairs(new_mapping_pairs) == [ (new_mft_cluster, 4), (new_second_cluster, 60) ]
+
+	# The mapping pairs of record 0 live at FRS offset 320 in this image; update the relocated copy and its mirror copy.
+	mapping_pairs_offset = 320
+	old_mapping_pairs = bytes.fromhex('21040001213c850100')
+
+	for base in (new_mft_cluster * cluster_size, mirror_cluster * cluster_size):
+		assert image[base + mapping_pairs_offset : base + mapping_pairs_offset + len(old_mapping_pairs)] == old_mapping_pairs
+		image[base + mapping_pairs_offset : base + mapping_pairs_offset + len(new_mapping_pairs)] = new_mapping_pairs
+
+	# Leave a decoy at the old $MFT location: the signature stays valid, but the first attribute has an impossible length.
+	image[old_mft_cluster * cluster_size + 60 : old_mft_cluster * cluster_size + 64] = struct.pack('<L', 7)
+
+	# Repoint the boot sector to the new $MFT location.
+	image[48 : 56] = struct.pack('<Q', new_mft_cluster)
+
+	return bytes(image)
+
+def _build_4kn_volume(mft_records, mft_cluster = 100, mirror_cluster = 2):
+	"""Assemble a minimal 4Kn (4096-byte sectors, 4096-byte FRS) NTFS volume around an existing raw $MFT image."""
+
+	record_size = 4096
+	cluster_size = 4096
+	record_count = len(mft_records) // record_size
+
+	mft = bytearray(mft_records)
+
+	# Rewrite the single data run of record 0: header 0x22, a 2-byte count and a 4-byte offset.
+	old_mapping_pairs = bytes.fromhex('220001aa29000000')
+	new_mapping_pairs = b'\x22' + record_count.to_bytes(2, byteorder = 'little') + mft_cluster.to_bytes(4, byteorder = 'little') + b'\x00'
+
+	position = mft.find(old_mapping_pairs)
+	assert position >= 0
+	mft[position : position + len(new_mapping_pairs)] = new_mapping_pairs
+	assert MFT.DecodeMappingPairs(new_mapping_pairs) == [ (mft_cluster, record_count) ]
+
+	total_clusters = mft_cluster + record_count + 10
+
+	boot = bytearray(open(BOOT_4Kn, 'rb').read())
+	boot[11] = 0
+	boot[12] = cluster_size // 256 # Bytes-per-sector exponent: 16.
+	boot[13] = 1 # One sector per cluster.
+	boot[40 : 48] = struct.pack('<Q', total_clusters) # Total sectors (one sector per cluster on a 4Kn volume).
+	boot[48 : 56] = struct.pack('<Q', mft_cluster)
+	boot[56 : 64] = struct.pack('<Q', mirror_cluster)
+	assert boot[64] == 1 # A positive FRS code means one cluster per FRS (4096 bytes).
+
+	bs = BootSector.BootSector(bytes(boot))
+	assert bs.get_bytes_per_sector() == 4096 and bs.get_sectors_per_cluster() == 1
+	assert bs.get_file_record_segment_size() == record_size
+
+	volume = bytearray(cluster_size * total_clusters)
+	volume[0 : 512] = boot # The boot sector occupies the first sector of the volume.
+	volume[mirror_cluster * cluster_size : mirror_cluster * cluster_size + 4 * record_size] = mft[ : 4 * record_size]
+	volume[mft_cluster * cluster_size : mft_cluster * cluster_size + len(mft)] = mft
+
+	return bytes(volume)
+
+def test_boot_geometry_record_positioning():
+	# Every geometry in the shipped boot sectors must yield self-consistent byte offsets and strides.
+	for boot_filename in [ BOOT_512, BOOT_4K, BOOT_4Kn, BOOT_64K, BOOT_128K, BOOT_NOBOOTCODE ]:
+		with open(boot_filename, 'rb') as f:
+			bs = BootSector.BootSector(f.read())
+
+		sector_size, cluster_size, frs_size, mft_offset, mirror_offset = _volume_geometry(bs)
+
+		# The cluster size is derived from both sector fields; the FRS size must be a supported size.
+		assert cluster_size == bs.get_sectors_per_cluster() * bs.get_bytes_per_sector()
+		assert frs_size in MFT.FILE_RECORD_SEGMENT_SIZES_SUPPORTED
+		assert frs_size % sector_size == 0
+
+		# Both metadata tables start on a cluster boundary derived from the same cluster size.
+		assert mft_offset == bs.get_first_mft_cluster() * cluster_size
+		assert mirror_offset == bs.get_first_mftmirr_cluster() * cluster_size
+		assert mft_offset % cluster_size == 0 and mirror_offset % cluster_size == 0
+
+		# Adjacent records are exactly one FRS size apart, and that stride is expressible in whole sectors.
+		assert (mft_offset + frs_size) - mft_offset == frs_size
+		assert frs_size % sector_size == 0
+
+		# The two tables cannot start at the same byte offset.
+		assert mft_offset != mirror_offset
+
+def test_mft_and_mirror_offsets_and_spans_are_consistent():
+	# On complete volume images, the boot-sector offsets and the actual on-disk spans must agree.
+	for volume_filename, volume_offset in [ (NTFS_FILE_4k, 0), (NTFS_FRAGMENTED_MFT, 128 * 512) ]:
+		raw = open(volume_filename, 'rb').read()
+
+		fs = MFT.FileSystemParser(io.BytesIO(raw), volume_offset)
+		mft = MFT.MasterFileTableParser(fs)
+
+		sector_size, cluster_size, frs_size, mft_offset, mirror_offset = _volume_geometry(fs.boot)
+
+		# The first data run of $MFT begins exactly where the boot sector says $MFT starts.
+		first_run_cluster, first_run_length = fs.data_runs[0]
+		assert volume_offset + first_run_cluster * cluster_size == volume_offset + mft_offset
+
+		# The declared FRS size of the first record on disk matches the boot-sector geometry.
+		first_frs = mft.get_file_record_segment_by_number(0)
+		assert first_frs.get_file_record_segment_size() == frs_size
+
+		# $MFTMirr: its boot-sector offset, its data-run span and its record count must all line up.
+		mirror_record = mft.get_file_record_by_number(MFT.FILE_NUMBER_MFTMIRR)
+		mirror_runs = mirror_record.get_data_runs()
+		mirror_size = mirror_record.get_data_size()
+		mirror_record_count = mirror_size // frs_size
+
+		assert mirror_runs[0][0] == fs.boot.get_first_mftmirr_cluster()
+		assert mirror_size == mirror_record_count * frs_size
+		assert mirror_size <= sum(run_length for __, run_length in mirror_runs) * cluster_size
+
+		# The mirror region on disk is a byte-identical copy of the first records of $MFT.
+		mirror_region = raw[volume_offset + mirror_offset : volume_offset + mirror_offset + mirror_size]
+		mft_region = raw[volume_offset + mft_offset : volume_offset + mft_offset + mirror_size]
+		assert mirror_region == mft_region
+
+		# Every mirrored record starts on an FRS boundary and parses with its expected $MFT number.
+		for record_number in range(mirror_record_count):
+			record_start = volume_offset + mirror_offset + record_number * frs_size
+			record_buf = raw[record_start : record_start + frs_size]
+
+			assert record_buf[ : 4] == MFT.MULTI_SECTOR_HEADER_SIGNATURE_GOOD
+
+			mirrored_frs = MFT.FileRecordSegment(record_buf, suggested_mft_number = record_number)
+			assert not mirrored_frs.is_bad()
+			assert mirrored_frs.get_master_file_table_number() == record_number
+
+			# Adjacent records do not overlap: the next record starts exactly frs_size bytes later.
+			if record_number + 1 < mirror_record_count:
+				next_start = volume_offset + mirror_offset + (record_number + 1) * frs_size
+				assert next_start - record_start == frs_size
+
+def test_adjacent_records_follow_volume_stride_on_both_layouts():
+	# The 1024-byte FRS layout and the 4096-byte (4Kn) layout must both locate adjacent records correctly.
+	raw = open(NTFS_FILE_4k, 'rb').read()
+	fs = MFT.FileSystemParser(io.BytesIO(raw))
+	mft = MFT.MasterFileTableParser(fs)
+
+	frs_size = fs.boot.get_file_record_segment_size()
+	mft_offset = fs.boot.get_first_mft_cluster() * fs.cluster_size
+
+	for record_number in range(8):
+		frs = mft.get_file_record_segment_by_number(record_number)
+		direct_buf = raw[mft_offset + record_number * frs_size : mft_offset + (record_number + 1) * frs_size]
+		direct_frs = MFT.FileRecordSegment(direct_buf, suggested_mft_number = record_number)
+
+		assert direct_frs.frs_data == frs.frs_data
+		assert direct_frs.get_master_file_table_number() == record_number
+
+	# A 4Kn volume: a 4096-byte stride over four adjacent records.
+	volume_4kn = _build_4kn_volume(open(MFT_4K, 'rb').read())
+	fs_4kn = MFT.FileSystemParser(io.BytesIO(volume_4kn))
+	mft_4kn = MFT.MasterFileTableParser(fs_4kn)
+
+	assert fs_4kn.boot.get_bytes_per_sector() == 4096
+	assert fs_4kn.boot.get_file_record_segment_size() == 4096
+
+	mft_offset_4kn = fs_4kn.boot.get_first_mft_cluster() * fs_4kn.cluster_size
+	for record_number in range(4):
+		frs = mft_4kn.get_file_record_segment_by_number(record_number)
+		direct_buf = volume_4kn[mft_offset_4kn + record_number * 4096 : mft_offset_4kn + (record_number + 1) * 4096]
+		direct_frs = MFT.FileRecordSegment(direct_buf, suggested_mft_number = record_number)
+
+		assert direct_frs.frs_data == frs.frs_data
+		assert direct_frs.get_master_file_table_number() == record_number
+
+def test_geometry_changes_invalidate_stale_record_positions():
+	# Mutating any geometry field must move (or invalidate) the record location; the old bytes are not evidence.
+	raw = open(NTFS_FILE_4k, 'rb').read()
+
+	def mutated(mutator):
+		image = bytearray(raw)
+		mutator(image)
+		return io.BytesIO(bytes(image))
+
+	# The unmutated volume parses successfully and establishes the trusted reference record.
+	fs = MFT.FileSystemParser(io.BytesIO(raw))
+	mft = MFT.MasterFileTableParser(fs)
+	trusted_frs = mft.get_file_record_segment_by_number(0)
+	trusted_offset = fs.boot.get_first_mft_cluster() * fs.cluster_size
+
+	# Invalid sector and cluster size encodings are rejected by the boot sector itself.
+	with pytest.raises(BootSector.BootSectorException):
+		MFT.FileSystemParser(mutated(lambda image: image.__setitem__(12, 1))) # 256-byte sectors.
+
+	with pytest.raises(BootSector.BootSectorException):
+		MFT.FileSystemParser(mutated(lambda image: image.__setitem__(13, 0))) # Zero sectors per cluster.
+
+	# A valid-but-different sector size moves the computed MFT offset onto non-record bytes.
+	with pytest.raises(MFT.FileRecordSegmentException):
+		MFT.FileSystemParser(mutated(lambda image: image.__setitem__(12, 4))) # 2048-byte sectors.
+
+	# Changing the sectors-per-cluster value shifts the cluster size and thus the MFT byte offset.
+	with pytest.raises(MFT.FileRecordSegmentException):
+		MFT.FileSystemParser(mutated(lambda image: image.__setitem__(13, 4)))
+
+	with pytest.raises(MFT.FileRecordSegmentException):
+		MFT.FileSystemParser(mutated(lambda image: image.__setitem__(13, 16)))
+
+	# Pointing the $MFT cluster field elsewhere reads whatever bytes are there, never a trusted record silently.
+	with pytest.raises(MFT.FileRecordSegmentException):
+		MFT.FileSystemParser(mutated(lambda image: image.__setitem__(slice(48, 56), struct.pack('<Q', 300))))
+
+	with pytest.raises(BootSector.BootSectorException):
+		MFT.FileSystemParser(mutated(lambda image: image.__setitem__(slice(48, 56), b'\x00' * 8)))
+
+	with pytest.raises(MFT.FileRecordSegmentException):
+		MFT.FileSystemParser(mutated(lambda image: image.__setitem__(slice(48, 56), struct.pack('<Q', 999999))))
+
+	# Corrupting the OEM signature invalidates the whole header.
+	with pytest.raises(BootSector.BootSectorException):
+		MFT.FileSystemParser(mutated(lambda image: image.__setitem__(slice(3, 11), b'XXXXXXXX')))
+
+	# An unsupported FRS size cannot be turned into a record location either.
+	with pytest.raises(MFT.FileRecordSegmentException):
+		MFT.FileSystemParser(mutated(lambda image: image.__setitem__(64, 0xF5))) # 2048 bytes.
+
+	with pytest.raises(MFT.FileRecordSegmentException):
+		MFT.FileSystemParser(mutated(lambda image: image.__setitem__(64, 0xF7))) # 512 bytes.
+
+	# The trusted reference is unaffected by all of the failed parses: its offset and bytes stay valid.
+	fs_again = MFT.FileSystemParser(io.BytesIO(raw))
+	mft_again = MFT.MasterFileTableParser(fs_again)
+	assert fs_again.boot.get_first_mft_cluster() * fs_again.cluster_size == trusted_offset
+	assert mft_again.get_file_record_segment_by_number(0).frs_data == trusted_frs.frs_data
+
+def old_location_frs_not_trusted(record_buf):
+	# A decoy FRS has a valid multisector header but fails structural validation: it is not a trusted record.
+	try:
+		frs = MFT.FileRecordSegment(record_buf, suggested_mft_number = 0)
+		for __ in frs.attributes():
+			pass
+	except MFT.FileRecordSegmentException:
+		return True
+
+	return False
+
+def test_relocated_mft_old_position_is_not_trusted_evidence():
+	# After the volume geometry moves $MFT, the parser must follow the new geometry; the stale location is not trusted.
+	raw = open(NTFS_FILE_4k, 'rb').read()
+	cluster_size = 4096
+	old_mft_cluster = 256
+	old_second_cluster = 645
+	new_mft_cluster = 38
+	new_second_cluster = 651
+	mirror_cluster = 2
+
+	image = _build_relocated_volume(raw, cluster_size, old_mft_cluster, old_second_cluster, new_mft_cluster, new_second_cluster, mirror_cluster)
+
+	# The parser follows the boot sector to the new location and exposes the rewritten data runs.
+	fs = MFT.FileSystemParser(io.BytesIO(image))
+	assert fs.boot.get_first_mft_cluster() == new_mft_cluster
+	assert fs.data_runs == [ (new_mft_cluster, 4), (new_second_cluster, 60) ]
+
+	mft = MFT.MasterFileTableParser(fs)
+	authoritative_frs = mft.get_file_record_segment_by_number(0)
+
+	# The authoritative record is the byte stream at the new location, not at the old one.
+	new_location_frs = MFT.FileRecordSegment(image[new_mft_cluster * cluster_size : new_mft_cluster * cluster_size + 1024], suggested_mft_number = 0)
+	assert authoritative_frs.frs_data == new_location_frs.frs_data
+
+	old_location_bytes = image[old_mft_cluster * cluster_size : old_mft_cluster * cluster_size + 1024]
+	assert old_location_bytes[ : 4] == MFT.MULTI_SECTOR_HEADER_SIGNATURE_GOOD # The decoy keeps a valid signature.
+	assert old_location_frs_not_trusted(old_location_bytes)
+	assert old_location_bytes != bytes(authoritative_frs.frs_data)
+
+	# The mirror still mirrors the relocated $MFT (its mapping pairs were updated alongside).
+	mirror_size = mft.get_file_record_by_number(MFT.FILE_NUMBER_MFTMIRR).get_data_size()
+	assert image[mirror_cluster * cluster_size : mirror_cluster * cluster_size + mirror_size] == image[new_mft_cluster * cluster_size : new_mft_cluster * cluster_size + mirror_size]
+
+	# Parsing the same image while trusting the stale geometry (old $MFT cluster) must fail on the decoy.
+	stale_image = bytearray(image)
+	stale_image[48 : 56] = struct.pack('<Q', old_mft_cluster)
+	with pytest.raises(MFT.MasterFileTableException):
+		MFT.FileSystemParser(io.BytesIO(bytes(stale_image)))
+
+	# A record that cannot be validated at its computed location must never be reported as a good record.
+	for file_record in mft.file_records():
+		assert not file_record.base_frs.is_bad()
+
+def test_4kn_synthetic_volume_locates_records_from_full_geometry():
+	# A 4Kn volume ties 4096-byte sectors, a one-sector cluster and 4096-byte records together end to end.
+	mft_raw = open(MFT_4K, 'rb').read()
+	volume = _build_4kn_volume(mft_raw)
+
+	fs = MFT.FileSystemParser(io.BytesIO(volume))
+	assert fs.cluster_size == 4096
+	assert fs.boot.get_bytes_per_sector() == 4096
+	assert fs.boot.get_sectors_per_cluster() == 1
+	assert fs.boot.get_file_record_segment_size() == 4096
+
+	expected_mft_offset = fs.boot.get_first_mft_cluster() * fs.cluster_size
+	assert expected_mft_offset == 100 * 4096
+	assert fs.data_runs == [ (100, len(mft_raw) // 4096) ]
+
+	mft = MFT.MasterFileTableParser(fs)
+	frs_zero = mft.get_file_record_segment_by_number(0)
+	assert frs_zero.get_file_record_segment_size() == 4096
+	assert frs_zero.get_master_file_table_number() == 0
+
+	# Mirror and $MFT first four records are the same 16384-byte region on disk.
+	mirror_offset = fs.boot.get_first_mftmirr_cluster() * fs.cluster_size
+	assert volume[mirror_offset : mirror_offset + 4 * 4096] == volume[expected_mft_offset : expected_mft_offset + 4 * 4096]
+
+	# A 512-byte-sector assumption would compute a different offset; the boot-sector-derived one must be the FILE signature.
+	assert volume[expected_mft_offset : expected_mft_offset + 4] == MFT.MULTI_SECTOR_HEADER_SIGNATURE_GOOD
+	wrong_offset = fs.boot.get_first_mft_cluster() * 512
+	assert volume[wrong_offset : wrong_offset + 4] != MFT.MULTI_SECTOR_HEADER_SIGNATURE_GOOD
+
+def test_ordinary_layouts_keep_their_original_read_results():
+	# All of the above must not change how ordinary, unmodified volumes are read.
+	expected_runs = {
+		NTFS_FILE_4k: [ (256, 4), (645, 60) ],
+		NTFS_FRAGMENTED_MFT: [ (597, 235), (1164, 116), (1304, 136), (1456, 112), (1616, 169) ]
+	}
+
+	for volume_filename, volume_offset in [ (NTFS_FILE_4k, 0), (NTFS_FRAGMENTED_MFT, 128 * 512) ]:
+		raw = open(volume_filename, 'rb').read()
+
+		fs = MFT.FileSystemParser(io.BytesIO(raw), volume_offset)
+		assert fs.data_runs == expected_runs[volume_filename]
+
+		mft = MFT.MasterFileTableParser(fs)
+
+		# Every enumerated base record is good and located at boot-geometry-derived boundaries.
+		frs_size = fs.boot.get_file_record_segment_size()
+		mft_offset = fs.boot.get_first_mft_cluster() * fs.cluster_size
+
+		record_numbers = []
+		for file_record in mft.file_records():
+			assert not file_record.base_frs.is_bad()
+			record_numbers.append(file_record.get_master_file_table_number())
+
+		# Each number is unique and matches the stride of records read straight from the image.
+		assert len(record_numbers) == len(set(record_numbers))
+		for record_number in record_numbers[ : 16]:
+			direct = raw[volume_offset + mft_offset + record_number * frs_size : volume_offset + mft_offset + (record_number + 1) * frs_size]
+			assert direct[ : 4] == MFT.MULTI_SECTOR_HEADER_SIGNATURE_GOOD
+
+		# Re-parsing through a nested volume offset yields byte-identical $MFT contents.
+		if volume_offset != 0:
+			aligned = MFT.FileSystemParser(io.BytesIO(raw[volume_offset : ]), 0)
+			fs.seek(0)
+			aligned.seek(0)
+			assert fs.read(fs.file_size) == aligned.read(aligned.file_size)
+
+	# The specific record documented in the ordinary-layout test keeps its data run.
+	fs = MFT.FileSystemParser(io.BytesIO(open(NTFS_FILE_4k, 'rb').read()))
+	mft = MFT.MasterFileTableParser(fs)
+	assert mft.get_file_record_by_number(34).get_data_runs() == [ (755, 1) ]
