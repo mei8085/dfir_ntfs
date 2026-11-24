@@ -5029,6 +5029,383 @@ def test_fat_orphan_lfn_at_eod():
 
 	assert c == 1
 
+def BuildFATLongEntry(LongName, Checksum, IsDeleted = False, EntryType = 0):
+	"""Build long name entries for a given name, ordered as they are stored on disk (the highest order number first).
+	If 'IsDeleted' is True, the first byte of every entry is set to 0xE5 (as for a deleted entry).
+	"""
+
+	chunks = [ LongName[i : i + 13] for i in range(0, len(LongName), 13) ]
+	buf = b''
+
+	for order in range(len(chunks), 0, -1):
+		raw = chunks[order - 1].encode('utf-16le') + b'\x00\x00'
+		if len(raw) < 26:
+			raw += b'\xFF\xFF' * ((26 - len(raw)) // 2)
+
+		entry = bytearray(32)
+
+		if IsDeleted:
+			entry[0] = 0xE5
+		elif order == len(chunks):
+			entry[0] = order | FAT.LAST_LONG_ENTRY
+		else:
+			entry[0] = order
+
+		entry[1 : 11] = raw[0 : 10]
+		entry[11] = FAT.ATTR_LONG_NAME
+		entry[12] = EntryType
+		entry[13] = Checksum
+		entry[14 : 26] = raw[10 : 22]
+		entry[28 : 32] = raw[22 : 26]
+
+		buf += bytes(entry)
+
+	return buf
+
+def BuildFATShortEntry(NameRaw, Attributes = FAT.ATTR_ARCHIVE, FirstCluster = 0, FileSize = 0, NTByte = 0):
+	"""Build an on-disk short (8.3) directory entry."""
+
+	entry = bytearray(32)
+	entry[0 : 11] = NameRaw
+	entry[11] = Attributes
+	entry[12] = NTByte
+	entry[26] = FirstCluster & 0xFF
+	entry[27] = (FirstCluster >> 8) & 0xFF
+	entry[28 : 32] = FileSize.to_bytes(4, 'little')
+
+	return bytes(entry)
+
+def PadFATDirectory(buf):
+	"""Pad a directory buffer to a whole number of sectors (at least one), as required by DirectoryEntries."""
+
+	if len(buf) % 512 != 0:
+		buf += b'\x00' * (512 - len(buf) % 512)
+
+	if len(buf) == 0:
+		buf = b'\x00' * 512
+
+	return buf
+
+def CollectFATEntries(buf, encoding = 'ascii', short_only = False):
+	"""Enumerate a directory buffer, return a list of FileEntry and OrphanLongEntry items."""
+
+	return list(FAT.DirectoryEntries(PadFATDirectory(buf)).entries(encoding, short_only))
+
+def test_fat_lfn_short_association():
+	# A long name can only be attached to a short entry when the evidence agrees: the checksum matches,
+	# the order numbers form a complete descending sequence starting at one, and the entries belong together.
+	# The synthetic directories below check that contract for both allocated and deleted entries.
+
+	short_name_raw = b'ALPHA   TXT'
+	checksum = FAT.BuildChecksum(short_name_raw)
+
+	# Allocated long name entries + an allocated short entry: the full name is confirmed.
+	buf = BuildFATLongEntry('Long Name Two!', checksum) + BuildFATShortEntry(short_name_raw, FirstCluster = 7, FileSize = 42)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 1 and type(items[0]) is FAT.FileEntry
+
+	i = items[0]
+	assert i.short_name == 'ALPHA.TXT' and i.short_name_raw == b'ALPHA.TXT'
+	assert i.long_name == 'Long Name Two!'
+	assert not i.is_deleted and not i.is_directory
+	assert i.first_cluster == 7 and i.size == 42
+
+	# The long name must be a full name, not a partial fragment.
+	ii = FAT.ExpandPath('/dir', i)
+	assert ii.long_name == '/dir/Long Name Two!'
+	assert ii.short_name == '/dir/ALPHA.TXT'
+
+	# A name spanning more than one long entry must be reassembled in the right order.
+	long_name_3 = 'A' * 13 + 'B' * 13 + 'C' * 13
+	buf = BuildFATLongEntry(long_name_3, checksum) + BuildFATShortEntry(short_name_raw, FirstCluster = 7, FileSize = 42)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 1 and type(items[0]) is FAT.FileEntry
+	assert items[0].long_name == long_name_3
+
+	# Ordered, allocated entries: names of one to three chunks must round-trip exactly (no truncation of a matched name).
+	for long_name in [ 'x.txt', 'X' * 13, 'Y' * 14, ('Z' * 13) * 3 ]:
+		buf = BuildFATLongEntry(long_name, checksum) + BuildFATShortEntry(short_name_raw, FirstCluster = 7, FileSize = 42)
+
+		items = CollectFATEntries(buf)
+		assert len(items) == 1 and type(items[0]) is FAT.FileEntry
+		assert items[0].long_name == long_name
+
+	# Deleted long entries + deleted short entry: the association is accepted even though the first byte is lost.
+	buf = BuildFATLongEntry('Long Name Two!', checksum, True) + BuildFATShortEntry(b'\xE5LONGT  TXT', FirstCluster = 7, FileSize = 42)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 1 and type(items[0]) is FAT.FileEntry
+
+	i = items[0]
+	assert i.is_deleted and i.short_name == '_LONGT.TXT'
+	assert i.long_name == 'Long Name Two!'
+
+	# The short entry's own status and fields are not changed by the long name.
+	assert i.short_name_raw == b'_LONGT.TXT'
+	assert i.first_cluster == 7 and i.size == 42 and not i.is_directory
+
+	# A directory entry keeps its directory status alongside the long name.
+	buf = BuildFATLongEntry('My Directory', checksum) + BuildFATShortEntry(short_name_raw, Attributes = FAT.ATTR_DIRECTORY, FirstCluster = 4)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 1 and type(items[0]) is FAT.FileEntry
+	assert items[0].is_directory and items[0].long_name == 'My Directory'
+
+def test_fat_lfn_ordinary_short_name_not_rewritten():
+	# When remnant long entries cannot be tied to a short entry, they must not be merged into an ordinary short name.
+	# The short name remains exactly what the short entry says, and the fragment is reported separately.
+
+	alpha = b'ALPHA   TXT'
+	bravo = b'BRAVO   TXT'
+	charlie = b'CHARLIE TXT'
+	delta = b'DELTA   TXT'
+	fox = b'FOX     TXT'
+
+	# Checksum mismatch (a remnant from some other file) before an allocated short entry.
+	buf = BuildFATLongEntry('remnant name.txt', (FAT.BuildChecksum(delta) + 1) & 0xFF) + BuildFATShortEntry(delta, FirstCluster = 10, FileSize = 45)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 2
+	assert type(items[0]) is FAT.OrphanLongEntry and items[0].long_name_partial == 'remnant name.txt'
+	assert type(items[1]) is FAT.FileEntry
+
+	i = items[1]
+	assert i.short_name == 'DELTA.TXT' and i.short_name_raw == b'DELTA.TXT'
+	assert i.long_name is None
+	assert not i.is_deleted and i.first_cluster == 10 and i.size == 45
+
+	# A checksum that happens to belong to a different short entry must not attach either.
+	buf = BuildFATLongEntry('other file.txt', FAT.BuildChecksum(bravo)) + BuildFATShortEntry(charlie, FirstCluster = 9, FileSize = 44)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 2
+	assert type(items[0]) is FAT.OrphanLongEntry and items[0].long_name_partial == 'other file.txt'
+	assert type(items[1]) is FAT.FileEntry and items[1].short_name == 'CHARLIE.TXT' and items[1].long_name is None
+
+	# A deleted (remnant) long name followed by an allocated short entry must not attach to it.
+	buf = BuildFATLongEntry('stale name.txt', FAT.BuildChecksum(fox), True) + BuildFATShortEntry(fox, FirstCluster = 11, FileSize = 46)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 2
+	assert type(items[0]) is FAT.OrphanLongEntry and items[0].long_name_partial == 'stale name.txt'
+	assert type(items[1]) is FAT.FileEntry and items[1].short_name == 'FOX.TXT' and items[1].long_name is None
+
+	# An out-of-sequence set (order 1 before order 2) is incoherent: the orphan appears and no name is attached.
+	full = BuildFATLongEntry('Long Name Two!', FAT.BuildChecksum(alpha))
+	buf = full[32 : ] + full[ : 32] + BuildFATShortEntry(alpha, FirstCluster = 7, FileSize = 42)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 2
+	assert type(items[0]) is FAT.OrphanLongEntry and items[0].long_name_partial == '!'
+	assert type(items[1]) is FAT.FileEntry and items[1].short_name == 'ALPHA.TXT' and items[1].long_name is None
+
+	# An incomplete set (the LAST_LONG_ENTRY flag is missing) is incoherent too.
+	broken = bytearray(full[0 : 32])
+	broken[0] = 2
+	buf = bytes(broken) + BuildFATShortEntry(alpha, FirstCluster = 7, FileSize = 42)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 1
+	assert type(items[0]) is FAT.FileEntry and items[0].short_name == 'ALPHA.TXT' and items[0].long_name is None
+
+	# A long name spent on the preceding (deleted) short entry must not also be given to the next live entry,
+	# even when that entry has the very same short name.
+	same_name_twice = BuildFATLongEntry('spent name.txt', FAT.BuildChecksum(fox)) + BuildFATShortEntry(b'\xE5OX     TXT', FirstCluster = 12, FileSize = 47)
+	same_name_twice += BuildFATShortEntry(fox, FirstCluster = 13, FileSize = 48)
+
+	items = CollectFATEntries(same_name_twice)
+	assert len(items) == 2
+	assert [ type(x) for x in items ] == [ FAT.FileEntry, FAT.FileEntry ]
+	assert items[0].is_deleted and items[0].short_name == '_OX.TXT' and items[0].long_name == 'spent name.txt'
+	assert items[1].short_name == 'FOX.TXT' and items[1].long_name is None
+	assert not items[1].is_deleted and items[1].first_cluster == 13 and items[1].size == 48
+
+def test_fat_orphan_fragments_standalone():
+	# Long name fragments without a confirmed short entry remain independently traceable (as orphan entries,
+	# with a partial name) but must never be reported as a complete name of any current file.
+
+	short_name_raw = b'GOLF    TXT'
+	checksum = FAT.BuildChecksum(short_name_raw)
+
+	# The fragment is separated from its short entry by a null (free) entry: the association is broken.
+	buf = BuildFATLongEntry('lost long.txt', checksum) + b'\x00' * 32 + BuildFATShortEntry(short_name_raw, FirstCluster = 12, FileSize = 47)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 2
+	assert type(items[0]) is FAT.OrphanLongEntry and items[0].long_name_partial == 'lost long.txt'
+	assert type(items[1]) is FAT.FileEntry
+
+	i = items[1]
+	assert i.short_name == 'GOLF.TXT' and i.long_name is None
+	# The short entry itself carries no evidence linking it to that fragment.
+	assert i.short_name_raw == b'GOLF.TXT'
+
+	# The orphan fragment is still traceable on its own, and gets a partial path.
+	orphan = FAT.ExpandPath('/dir', items[0])
+	assert type(orphan) is FAT.OrphanLongEntry and orphan.long_name_partial == '/dir/lost long.txt'
+
+	# A long entry whose entry type field is not zero is not a name at all: it neither attaches nor becomes an orphan by itself.
+	buf = BuildFATLongEntry('bad type', checksum, EntryType = 1) + BuildFATShortEntry(short_name_raw, FirstCluster = 5, FileSize = 1)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 1
+	assert type(items[0]) is FAT.FileEntry and items[0].short_name == 'GOLF.TXT' and items[0].long_name is None
+
+	# Two orphan fragments in a row each remain separate fragments; each is followed by an ordinary short name.
+	buf = BuildFATLongEntry('first fragment', (checksum + 1) & 0xFF)
+	buf += BuildFATShortEntry(short_name_raw, FirstCluster = 7, FileSize = 42)
+	buf += BuildFATLongEntry('second fragment', (checksum + 2) & 0xFF)
+	buf += BuildFATShortEntry(b'BRAVO   TXT', FirstCluster = 8, FileSize = 43)
+
+	items = CollectFATEntries(buf)
+	assert [ type(x) for x in items ] == [ FAT.OrphanLongEntry, FAT.FileEntry, FAT.OrphanLongEntry, FAT.FileEntry ]
+	assert items[0].long_name_partial == 'first fragment'
+	assert items[1].short_name == 'GOLF.TXT' and items[1].long_name is None
+	assert items[2].long_name_partial == 'second fragment'
+	assert items[3].short_name == 'BRAVO.TXT' and items[3].long_name is None
+
+	# Matched long entries attached to a deleted short entry are a confirmed full name (not a fragment):
+	# here the evidence does agree, so the full name is allowed.
+	buf = BuildFATLongEntry('confirmed.txt', checksum) + BuildFATShortEntry(b'\xE5OLF    TXT', FirstCluster = 12, FileSize = 47)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 1 and type(items[0]) is FAT.FileEntry
+	assert items[0].is_deleted and items[0].short_name == '_OLF.TXT'
+	assert items[0].long_name == 'confirmed.txt'
+
+def test_fat_lfn_remnant_after_null_entry():
+	# Entries found after a null (free) directory entry are shown as deleted with an unknown status.
+	# A long name fragment before the null entry must not claim the remnant entry as its file.
+
+	short_name_raw = b'ALPHA   TXT'
+	checksum = FAT.BuildChecksum(short_name_raw)
+
+	buf = BuildFATLongEntry('allocated name', checksum) + b'\x00' * 32 + BuildFATShortEntry(short_name_raw, FirstCluster = 6, FileSize = 11)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 2
+	assert type(items[0]) is FAT.OrphanLongEntry and items[0].long_name_partial == 'allocated name'
+	assert type(items[1]) is FAT.FileEntry
+
+	i = items[1]
+	assert i.short_name == 'ALPHA.TXT'
+	assert i.long_name is None
+	# The status after a null entry is unknown, so it is reported as None rather than False.
+	assert i.is_deleted is None
+	assert i.first_cluster == 6 and i.size == 11
+
+	# A deleted long name before a null entry also stays a fragment.
+	buf = BuildFATLongEntry('stale name.txt', checksum, True) + b'\x00' * 32 + BuildFATShortEntry(b'BRAVO   TXT', FirstCluster = 7, FileSize = 12)
+
+	items = CollectFATEntries(buf)
+	assert len(items) == 2
+	assert type(items[0]) is FAT.OrphanLongEntry and items[0].long_name_partial == 'stale name.txt'
+	assert type(items[1]) is FAT.FileEntry and items[1].short_name == 'BRAVO.TXT' and items[1].long_name is None
+	assert items[1].is_deleted is None
+
+@pytest.mark.parametrize('fixture, encoding', [
+	(FAT_DIRENT_1, 'cp866'),
+	(FAT_DIRENT_2, 'ascii'),
+	(FAT_DIRENT_3, 'ascii'),
+	(FAT_DIRENT_ORPHAN, 'cp866'),
+	(FAT_DIRENT_VERYLONG, 'cp866'),
+	(FAT_ALFN_DSFN, 'ascii')
+])
+def test_fat_directory_identity_full_vs_short_only(fixture, encoding):
+	# The same directory must describe the same files whether or not long entries are parsed.
+	# Skipping the long name stanza (short_only = True) changes only the long name, never the set of file identities.
+
+	buf = open(fixture, 'rb').read()
+	buf = PadFATDirectory(buf)
+
+	full = [ i for i in CollectFATEntries(buf, encoding, False) if type(i) is FAT.FileEntry ]
+	short = CollectFATEntries(buf, encoding, True)
+
+	assert len(full) == len(short)
+
+	for i_full, i_short in zip(full, short):
+		assert type(i_short) is FAT.FileEntry
+
+		# Every field except the long name must agree between the two views.
+		assert i_full._replace(long_name = None) == i_short
+
+		# A long name, when present in the full view, is a complete (non-fragment) name.
+		if i_full.long_name is not None:
+			assert i_full.long_name != ''
+
+	# The two views must produce the same paths.
+	for i_full, i_short in zip(full, short):
+		p_full = FAT.ExpandPath('/d', i_full)
+		p_short = FAT.ExpandPath('/d', i_short)
+
+		assert p_full._replace(long_name = None) == p_short._replace(long_name = None)
+
+		if i_full.long_name is not None:
+			assert p_full.long_name == '/d/' + i_full.long_name
+		else:
+			assert p_short.long_name is None
+
+def test_fat_orphan_lfn_is_not_a_file_name():
+	# Across a real directory image, an orphan fragment must be reported separately and must not appear as the
+	# long name of any file entry: neither the entry it precedes nor any other entry may claim it.
+
+	buf = PadFATDirectory(open(FAT_DIRENT_ORPHAN, 'rb').read())
+
+	items = CollectFATEntries(buf, 'cp866', False)
+
+	orphans = [ i.long_name_partial for i in items if type(i) is FAT.OrphanLongEntry ]
+	files = [ i for i in items if type(i) is FAT.FileEntry ]
+
+	assert orphans == [ 'long_name_test.txt' ]
+
+	for i in files:
+		# No file in this directory adopts the fragment as its full name.
+		assert i.long_name != 'long_name_test.txt'
+
+	# The entry right after the fragment keeps its plain short name: the checksum does not match.
+	short_entries = [ i for i in files if i.short_name == 'SHORT.TXT' ]
+	assert len(short_entries) == 1
+	assert short_entries[0].long_name is None and not short_entries[0].is_deleted
+
+	# The short-only view reports the same files without inventing any long name.
+	for i in CollectFATEntries(buf, 'cp866', True):
+		assert i.long_name is None
+
+def test_fat_orphan_lfn_during_walk():
+	# During a file system walk, an unconfirmed long name fragment is reported as its own item, with the
+	# directory path prefixed, and the adjacent short entry keeps its plain short name.
+
+	f = gzip.open(FAT_FS_LSN, 'rb')
+	fs = FAT.FileSystemParser(f, 0, None)
+
+	orphans = []
+	short_txt = []
+
+	for i in fs.walk():
+		if type(i) is FAT.OrphanLongEntry:
+			orphans.append(i.long_name_partial)
+			continue
+
+		if type(i) is FAT.FileEntry and i.short_name == '/SHORT.TXT':
+			short_txt.append(i)
+
+	assert orphans == [ '/long_name_test.txt' ]
+
+	assert len(short_txt) == 1
+	i = short_txt[0]
+	assert i.long_name is None and not i.is_deleted and not i.is_directory
+	assert i.short_name_raw == b'SHORT.TXT'
+
+	# The fragment is traceable on its own, but is not the name of any file.
+	for i in fs.walk():
+		if type(i) is FAT.FileEntry:
+			assert i.long_name != '/long_name_test.txt'
+			assert i.long_name != 'long_name_test.txt'
+
+	f.close()
+
 def test_fat_deleted_dir_extra():
 	f = gzip.open(FAT_DELETED_DIR, 'rb')
 
