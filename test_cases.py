@@ -5261,3 +5261,410 @@ def test_fat_64bit_sector_count():
 	assert warn_cnt == 1
 
 	FAT.WARN_FUNC = warn_old
+
+# ---------------------------------------------------------------------------
+# Multi-generation shadow copies: evidence provenance for historical files.
+#
+# When a file range is restored from a volume shadow copy, every byte returned
+# for a given historical view must be attributable to that point in time only:
+#   1. each generation must expose its own bytes for the same virtual range,
+#   2. a view must never be stitched together from blocks of different times,
+#   3. later overwrites must not alter an earlier (already taken) view,
+#   4. a plain fallback to the original (live) volume must still yield
+#      provable, byte-for-byte identical file content.
+# ---------------------------------------------------------------------------
+
+VSS_TWO_VOLUME_OFFSET = 67584 * 512
+VSS_TWO_FILE_OFFSET = 1837 * 4096
+VSS_TWO_FILE_CLUSTERS = 172
+VSS_TWO_FILE_LENGTH = VSS_TWO_FILE_CLUSTERS * 4096
+
+VSS_THREE_VOLUME_OFFSET = 4196352 * 512
+VSS_THREE_STORAGE_OFFSET = 2048 * 512
+VSS_THREE_FILE_OFFSET = 261856 * 4096
+VSS_THREE_FILE_LENGTH = 52272
+
+VSS_TEN_VOLUME_OFFSET = 2048 * 512
+VSS_TEN_GENERATIONS = 6
+VSS_TEN_FILE_VIRTUAL_OFFSET = 3149922304 # A 16 KiB-aligned data block present in every generation.
+VSS_TEN_OVERLAY_OFFSET = 0x24000 # A data block combining a regular entry with overlay entries.
+VSS_TEN_DATA_BLOCK_SIZE = 0x4000
+
+def test_shadow_evidence_two_volumes_generation_purity():
+	# Two shadow copies of one volume, the diff area lives on a second volume.
+	# The same file range carries a distinct, single-generation byte pattern
+	# ('1', '2') in each historical view and the current overwrite ('3') on the live volume.
+	f_volume = tarfile.open(VOLUME_VSS_TWO_1, 'r').extractfile('vss_1_vol.raw')
+	f_storage = tarfile.open(VOLUME_VSS_TWO_2, 'r').extractfile('vss_2_stor.raw')
+
+	parser = ShadowCopy.ShadowParserTwoVolumes(f_volume, f_storage, VSS_TWO_VOLUME_OFFSET, None, VSS_TWO_VOLUME_OFFSET)
+
+	stack_positions = [ shadow.stack_position for shadow in parser.shadows() ]
+	assert stack_positions == [ 1, 2 ]
+
+	historical_views = {}
+	for stack_position in stack_positions:
+		view_parser = ShadowCopy.ShadowParserTwoVolumes(f_volume, f_storage, VSS_TWO_VOLUME_OFFSET, None, VSS_TWO_VOLUME_OFFSET)
+		view_parser.select_shadow(stack_position)
+		view_parser.seek(VSS_TWO_FILE_OFFSET)
+		historical_views[stack_position] = view_parser.read(VSS_TWO_FILE_LENGTH)
+
+	# Each historical view must be attributable to its own point in time.
+	assert historical_views[1] == b'1' * 703800 + b'\x00' * 712
+	assert historical_views[2] == b'2' * 703800 + b'\x00' * 712
+
+	# The live volume carries a later overwrite that is not evidence for either view.
+	f_volume.seek(VSS_TWO_VOLUME_OFFSET + VSS_TWO_FILE_OFFSET)
+	live_bytes = f_volume.read(VSS_TWO_FILE_LENGTH)
+	assert live_bytes == b'3' * 703800 + b'\x00' * 712
+
+	# No cross-block mixing: a view may contain only its own generation marker, never
+	# a full block belonging to another generation (earlier, later or live).
+	assert b'2' * 4096 not in historical_views[1]
+	assert b'3' * 4096 not in historical_views[1]
+	assert b'1' * 4096 not in historical_views[2]
+	assert b'3' * 4096 not in historical_views[2]
+	assert historical_views[1] != historical_views[2]
+	assert historical_views[1] != live_bytes and historical_views[2] != live_bytes
+
+	# Per-cluster purity: every allocated 4 KiB cluster of every view holds one marker only.
+	for stack_position, marker in ((1, b'1'), (2, b'2')):
+		for cluster_index in range(VSS_TWO_FILE_CLUSTERS):
+			cluster = historical_views[stack_position][cluster_index * 4096 : (cluster_index + 1) * 4096]
+			body = cluster.rstrip(b'\x00')
+			assert len(body) == 0 or set(body) == { marker[0] }
+
+	f_volume.close()
+	f_storage.close()
+
+def test_shadow_evidence_two_volumes_translation_isolation():
+	# At the translation layer, each 16 KiB block of the file range must resolve to
+	# storage-volume offsets specific to the selected generation; the two historical
+	# views must never share a translation for a block they store differently.
+	f_volume = tarfile.open(VOLUME_VSS_TWO_1, 'r').extractfile('vss_1_vol.raw')
+	f_storage = tarfile.open(VOLUME_VSS_TWO_2, 'r').extractfile('vss_2_stor.raw')
+
+	parser_1 = ShadowCopy.ShadowParserTwoVolumes(f_volume, f_storage, VSS_TWO_VOLUME_OFFSET, None, VSS_TWO_VOLUME_OFFSET)
+	parser_1.select_shadow(1)
+	parser_2 = ShadowCopy.ShadowParserTwoVolumes(f_volume, f_storage, VSS_TWO_VOLUME_OFFSET, None, VSS_TWO_VOLUME_OFFSET)
+	parser_2.select_shadow(2)
+
+	block_first = VSS_TWO_FILE_OFFSET // VSS_TEN_DATA_BLOCK_SIZE
+	block_count = VSS_TWO_FILE_LENGTH // VSS_TEN_DATA_BLOCK_SIZE
+	assert block_count * VSS_TEN_DATA_BLOCK_SIZE == VSS_TWO_FILE_LENGTH
+
+	differing_blocks = 0
+	for block_index in range(block_first, block_first + block_count):
+		virtual_offset = block_index * VSS_TEN_DATA_BLOCK_SIZE
+		translation_1 = parser_1.translate_exact_offset(virtual_offset)
+		translation_2 = parser_2.translate_exact_offset(virtual_offset)
+
+		assert len(translation_1) == 32 and len(translation_2) == 32
+
+		# Both views source this range from the storage (diff area) volume, never from
+		# the live original volume whose bytes already belong to a later generation.
+		assert all(use_storage_volume for use_storage_volume, storage_offset in translation_1)
+		assert all(use_storage_volume for use_storage_volume, storage_offset in translation_2)
+
+		if translation_1 != translation_2:
+			differing_blocks += 1
+
+		# Every individual 512-byte sector resolves to exactly one storage location.
+		assert all(storage_offset is not None and storage_offset % 512 == 0 for use_storage_volume, storage_offset in translation_1)
+		assert all(storage_offset is not None and storage_offset % 512 == 0 for use_storage_volume, storage_offset in translation_2)
+
+	# Every block of this range is stored per-generation, so every translation differs.
+	assert differing_blocks == block_count
+
+	f_volume.close()
+	f_storage.close()
+
+def test_shadow_evidence_two_volumes_immutability_and_fallback():
+	# Selecting a later shadow copy (the overwrite generation) must not rewrite the
+	# earlier view, and blocks absent from every diff area must fall back to the
+	# original volume with provable, byte-for-byte identical content.
+	f_volume = tarfile.open(VOLUME_VSS_TWO_1, 'r').extractfile('vss_1_vol.raw')
+	f_storage = tarfile.open(VOLUME_VSS_TWO_2, 'r').extractfile('vss_2_stor.raw')
+
+	parser = ShadowCopy.ShadowParserTwoVolumes(f_volume, f_storage, VSS_TWO_VOLUME_OFFSET, None, VSS_TWO_VOLUME_OFFSET)
+
+	# Reference bytes of the earliest view.
+	parser.select_shadow(1)
+	parser.seek(VSS_TWO_FILE_OFFSET)
+	earliest_bytes = parser.read(VSS_TWO_FILE_LENGTH)
+
+	# Walk to the newest generation and back: the earliest view must remain unchanged.
+	parser.select_shadow(2)
+	parser.seek(VSS_TWO_FILE_OFFSET)
+	assert parser.read(VSS_TWO_FILE_LENGTH) == b'2' * 703800 + b'\x00' * 712
+
+	parser.select_shadow(1)
+	parser.seek(VSS_TWO_FILE_OFFSET)
+	assert parser.read(VSS_TWO_FILE_LENGTH) == earliest_bytes
+
+	# A block present only in the newer store must be reached from the older view by
+	# following the store chain (it still resolves into the storage volume).
+	chained_offset = 0x12c000
+	parser_1 = ShadowCopy.ShadowParserTwoVolumes(f_volume, f_storage, VSS_TWO_VOLUME_OFFSET, None, VSS_TWO_VOLUME_OFFSET)
+	parser_1.select_shadow(1)
+	parser_2 = ShadowCopy.ShadowParserTwoVolumes(f_volume, f_storage, VSS_TWO_VOLUME_OFFSET, None, VSS_TWO_VOLUME_OFFSET)
+	parser_2.select_shadow(2)
+
+	chain_translation_1 = parser_1.translate_exact_offset(chained_offset)
+	chain_translation_2 = parser_2.translate_exact_offset(chained_offset)
+	assert chain_translation_1 == chain_translation_2
+	assert all(use_storage_volume for use_storage_volume, storage_offset in chain_translation_1)
+
+	parser_1.seek(chained_offset)
+	chained_from_earlier = parser_1.read(VSS_TEN_DATA_BLOCK_SIZE)
+	parser_2.seek(chained_offset)
+	chained_from_newer = parser_2.read(VSS_TEN_DATA_BLOCK_SIZE)
+	assert chained_from_earlier == chained_from_newer
+
+	f_volume.seek(VSS_TWO_VOLUME_OFFSET + chained_offset)
+	assert chained_from_earlier != f_volume.read(VSS_TEN_DATA_BLOCK_SIZE)
+
+	# Fallback: a block recorded in no diff area resolves to the original volume offsets
+	# in every generation and its virtual bytes equal the live volume bytes exactly.
+	fallback_offset = 0x7dc000
+	expected_fallback = [ (False, fallback_offset + sector_index * 512) for sector_index in range(32) ]
+
+	for stack_position in (1, 2):
+		fallback_parser = ShadowCopy.ShadowParserTwoVolumes(f_volume, f_storage, VSS_TWO_VOLUME_OFFSET, None, VSS_TWO_VOLUME_OFFSET)
+		fallback_parser.select_shadow(stack_position)
+		assert fallback_parser.translate_exact_offset(fallback_offset) == expected_fallback
+
+		fallback_parser.seek(fallback_offset)
+		virtual_bytes = fallback_parser.read(VSS_TEN_DATA_BLOCK_SIZE)
+
+		f_volume.seek(VSS_TWO_VOLUME_OFFSET + fallback_offset)
+		live_bytes = f_volume.read(VSS_TEN_DATA_BLOCK_SIZE)
+		assert live_bytes != b'\x00' * VSS_TEN_DATA_BLOCK_SIZE # A meaningful, provable artifact.
+		assert virtual_bytes == live_bytes
+		assert hashlib.md5(virtual_bytes).hexdigest() == hashlib.md5(live_bytes).hexdigest()
+
+	f_volume.close()
+	f_storage.close()
+
+def test_shadow_evidence_three_volumes_combined_image():
+	# A volume and its storage area combined in one image: two generations plus a live
+	# overwrite of the same file range, exercised through the two-volume parser.
+	f_combined = tarfile.open(VOLUME_VSS_TWO_3, 'r').extractfile('vss_3_volstor.raw')
+
+	parser = ShadowCopy.ShadowParserTwoVolumes(f_combined, f_combined, VSS_THREE_VOLUME_OFFSET, None, VSS_THREE_STORAGE_OFFSET)
+	assert [ shadow.stack_position for shadow in parser.shadows() ] == [ 1, 2 ]
+
+	views = {}
+	for stack_position in (1, 2):
+		view_parser = ShadowCopy.ShadowParserTwoVolumes(f_combined, f_combined, VSS_THREE_VOLUME_OFFSET, None, VSS_THREE_STORAGE_OFFSET)
+		view_parser.select_shadow(stack_position)
+		view_parser.seek(VSS_THREE_FILE_OFFSET)
+		views[stack_position] = view_parser.read(VSS_THREE_FILE_LENGTH)
+
+	# Each view is a pure, single-generation artifact.
+	assert views[1].strip(b'1') == b''
+	assert views[2].strip(b'2') == b''
+	assert views[1] != views[2]
+	assert b'2' * 4096 not in views[1] and b'1' * 4096 not in views[2]
+
+	# The live range is a still-later overwrite, excluded from both historical views.
+	f_combined.seek(VSS_THREE_VOLUME_OFFSET + VSS_THREE_FILE_OFFSET)
+	live_bytes = f_combined.read(VSS_THREE_FILE_LENGTH)
+	assert live_bytes.strip(b'3') == b''
+	assert live_bytes != views[1] and live_bytes != views[2]
+	assert b'3' * 4096 not in views[1] and b'3' * 4096 not in views[2]
+
+	# Every 16 KiB block of the range resolves per-generation into the storage area.
+	block_first = VSS_THREE_FILE_OFFSET // VSS_TEN_DATA_BLOCK_SIZE
+	block_count = (VSS_THREE_FILE_LENGTH + VSS_TEN_DATA_BLOCK_SIZE - 1) // VSS_TEN_DATA_BLOCK_SIZE
+
+	parser_1 = ShadowCopy.ShadowParserTwoVolumes(f_combined, f_combined, VSS_THREE_VOLUME_OFFSET, None, VSS_THREE_STORAGE_OFFSET)
+	parser_1.select_shadow(1)
+	parser_2 = ShadowCopy.ShadowParserTwoVolumes(f_combined, f_combined, VSS_THREE_VOLUME_OFFSET, None, VSS_THREE_STORAGE_OFFSET)
+	parser_2.select_shadow(2)
+
+	for block_index in range(block_first, block_first + block_count):
+		virtual_offset = block_index * VSS_TEN_DATA_BLOCK_SIZE
+		translation_1 = parser_1.translate_exact_offset(virtual_offset)
+		translation_2 = parser_2.translate_exact_offset(virtual_offset)
+		assert translation_1 != translation_2
+		assert all(use_storage_volume for use_storage_volume, storage_offset in translation_1)
+		assert all(use_storage_volume for use_storage_volume, storage_offset in translation_2)
+
+	# Re-selecting the earliest view after the newest one returns identical evidence.
+	parser_2.select_shadow(1)
+	parser_2.seek(VSS_THREE_FILE_OFFSET)
+	assert parser_2.read(VSS_THREE_FILE_LENGTH) == views[1]
+
+	f_combined.close()
+
+def test_shadow_evidence_ten_six_generations_one_file_range():
+	# A single volume holding six shadow generations: the same virtual file block must
+	# resolve to six distinct, time-specific byte sequences and remain immutable once
+	# every later generation has been selected.
+	f_volume = tarfile.open(VOLUME_VSS_10, 'r').extractfile('vss_10.raw')
+
+	parser = ShadowCopy.ShadowParser(f_volume, VSS_TEN_VOLUME_OFFSET)
+	assert [ shadow.stack_position for shadow in parser.shadows() ] == list(range(1, VSS_TEN_GENERATIONS + 1))
+
+	translations = {}
+	block_bytes = {}
+
+	for stack_position in range(1, VSS_TEN_GENERATIONS + 1):
+		view_parser = ShadowCopy.ShadowParser(f_volume, VSS_TEN_VOLUME_OFFSET)
+		view_parser.select_shadow(stack_position)
+
+		translation = view_parser.translate_exact_offset(VSS_TEN_FILE_VIRTUAL_OFFSET)
+		assert len(translation) == 32
+		translations[stack_position] = translation
+
+		view_parser.seek(VSS_TEN_FILE_VIRTUAL_OFFSET)
+		block_bytes[stack_position] = view_parser.read(VSS_TEN_DATA_BLOCK_SIZE)
+		assert len(block_bytes[stack_position]) == VSS_TEN_DATA_BLOCK_SIZE
+
+	# Six generations must yield six distinct translations and six distinct contents:
+	# no generation may borrow another point-in-time block for this virtual range.
+	assert len(set(tuple(translation) for translation in translations.values())) == VSS_TEN_GENERATIONS
+	assert len(set(block_bytes.values())) == VSS_TEN_GENERATIONS
+
+	# Materialize each translated block independently and prove it matches the file-like view.
+	for stack_position in range(1, VSS_TEN_GENERATIONS + 1):
+		reconstructed = b''
+		for storage_offset in translations[stack_position]:
+			if storage_offset is None:
+				reconstructed += b'\x00' * 512
+			else:
+				f_volume.seek(VSS_TEN_VOLUME_OFFSET + storage_offset)
+				sector = f_volume.read(512)
+				assert len(sector) == 512
+				reconstructed += sector
+
+		assert reconstructed == block_bytes[stack_position]
+
+	# Walk the entire stack forward, then return to the earliest generation: its evidence
+	# must be byte-identical to what was captured before any later view was selected.
+	walking_parser = ShadowCopy.ShadowParser(f_volume, VSS_TEN_VOLUME_OFFSET)
+	for stack_position in range(1, VSS_TEN_GENERATIONS + 1):
+		walking_parser.select_shadow(stack_position)
+	walking_parser.select_shadow(1)
+	walking_parser.seek(VSS_TEN_FILE_VIRTUAL_OFFSET)
+	assert walking_parser.read(VSS_TEN_DATA_BLOCK_SIZE) == block_bytes[1]
+
+	f_volume.close()
+
+def test_shadow_evidence_ten_overlay_block_is_not_mixed():
+	# Overlay entries back up only some 512-byte sectors of a 16 KiB block while a regular
+	# entry supplies the remainder. The restored block must be composed from exactly these
+	# two in-time sources of the SAME store: a sector is never filled from a different
+	# generation, and overlay-marked sectors never keep the live original offset.
+	f_volume = tarfile.open(VOLUME_VSS_10, 'r').extractfile('vss_10.raw')
+
+	view_parser = ShadowCopy.ShadowParser(f_volume, VSS_TEN_VOLUME_OFFSET)
+	view_parser.select_shadow(1)
+
+	overlay_entries = [ entry for entry in view_parser.current_diff_area
+		if entry.original_volume_offset == VSS_TEN_OVERLAY_OFFSET and
+		entry.flags & ShadowCopy.DIFF_AREA_TABLE_ENTRY_UNKNOWN_NAME_2 ]
+	regular_entries = [ entry for entry in view_parser.current_diff_area
+		if entry.original_volume_offset == VSS_TEN_OVERLAY_OFFSET and
+		(entry.flags & ShadowCopy.DIFF_AREA_TABLE_ENTRY_UNKNOWN_NAME_2) == 0 ]
+
+	assert len(overlay_entries) >= 1 and len(regular_entries) == 1
+
+	regular_entry = regular_entries[0]
+	cumulative_bitmap = 0
+	for entry in overlay_entries:
+		cumulative_bitmap |= entry.allocation_bitmap
+
+	marked_sectors = [ sector_index for sector_index in range(32) if (cumulative_bitmap >> sector_index) & 1 ]
+	assert len(marked_sectors) > 0 and len(marked_sectors) < 32 # A genuinely partial block.
+
+	# Reconstruct the expected translation using the store's own regular and overlay entries.
+	expected_translation = [ regular_entry.data_block_volume_offset + sector_index * 512 for sector_index in range(32) ]
+	for entry in overlay_entries:
+		for sector_index in range(32):
+			if (entry.allocation_bitmap >> sector_index) & 1:
+				expected_translation[sector_index] = entry.data_block_volume_offset + sector_index * 512
+
+	actual_translation = view_parser.translate_exact_offset(VSS_TEN_OVERLAY_OFFSET)
+	assert actual_translation == expected_translation
+
+	# The overlay part must never resolve to the live original offset; the base part keeps
+	# the regular entry's block. Every sector has exactly one source, so no mixed-time block.
+	for sector_index in range(32):
+		if sector_index in marked_sectors:
+			assert actual_translation[sector_index] != VSS_TEN_OVERLAY_OFFSET + sector_index * 512
+		else:
+			assert actual_translation[sector_index] == regular_entry.data_block_volume_offset + sector_index * 512
+
+	# File-level proof: the composed block read through the virtual volume equals a manual
+	# assembly of the same translated sectors (all sourced from this generation's store).
+	view_parser.seek(VSS_TEN_OVERLAY_OFFSET)
+	composed_block = view_parser.read(VSS_TEN_DATA_BLOCK_SIZE)
+
+	assembled_block = b''
+	for storage_offset in actual_translation:
+		assert storage_offset is not None
+		f_volume.seek(VSS_TEN_VOLUME_OFFSET + storage_offset)
+		sector = f_volume.read(512)
+		assert len(sector) == 512
+		assembled_block += sector
+
+	assert composed_block == assembled_block
+
+	# The same overlay block in a later generation is an independent, different artifact.
+	later_parser = ShadowCopy.ShadowParser(f_volume, VSS_TEN_VOLUME_OFFSET)
+	later_parser.select_shadow(2)
+	later_parser.seek(VSS_TEN_OVERLAY_OFFSET)
+	later_block = later_parser.read(VSS_TEN_DATA_BLOCK_SIZE)
+	assert later_block != composed_block
+
+	# And the earliest view stays immutable after selecting that later generation.
+	view_parser.select_shadow(2)
+	view_parser.select_shadow(1)
+	view_parser.seek(VSS_TEN_OVERLAY_OFFSET)
+	assert view_parser.read(VSS_TEN_DATA_BLOCK_SIZE) == composed_block
+
+	f_volume.close()
+
+def test_shadow_evidence_ten_original_volume_fallback():
+	# A virtual block absent from the diff area of every generation must fall back to the
+	# original volume in all six views, and the restored bytes must be provably identical
+	# to a direct read of the live volume.
+	f_volume = tarfile.open(VOLUME_VSS_10, 'r').extractfile('vss_10.raw')
+
+	covered_offsets = set()
+	for stack_position in range(1, VSS_TEN_GENERATIONS + 1):
+		metadata_parser = ShadowCopy.ShadowParser(f_volume, VSS_TEN_VOLUME_OFFSET)
+		metadata_parser.select_shadow(stack_position)
+		covered_offsets.update(entry.original_volume_offset for entry in metadata_parser.current_diff_area)
+
+	fallback_offset = None
+	for block_index in range(100, 5000):
+		candidate_offset = block_index * VSS_TEN_DATA_BLOCK_SIZE
+		if candidate_offset not in covered_offsets:
+			f_volume.seek(VSS_TEN_VOLUME_OFFSET + candidate_offset)
+			if f_volume.read(VSS_TEN_DATA_BLOCK_SIZE) != b'\x00' * VSS_TEN_DATA_BLOCK_SIZE:
+				fallback_offset = candidate_offset
+				break
+
+	assert fallback_offset is not None
+	expected_fallback = [ fallback_offset + sector_index * 512 for sector_index in range(32) ]
+
+	f_volume.seek(VSS_TEN_VOLUME_OFFSET + fallback_offset)
+	live_block = f_volume.read(VSS_TEN_DATA_BLOCK_SIZE)
+	live_md5 = hashlib.md5(live_block).hexdigest()
+
+	for stack_position in range(1, VSS_TEN_GENERATIONS + 1):
+		view_parser = ShadowCopy.ShadowParser(f_volume, VSS_TEN_VOLUME_OFFSET)
+		view_parser.select_shadow(stack_position)
+
+		# Translation points straight at the original volume offsets in every generation.
+		assert view_parser.translate_exact_offset(fallback_offset) == expected_fallback
+
+		view_parser.seek(fallback_offset)
+		restored_block = view_parser.read(VSS_TEN_DATA_BLOCK_SIZE)
+		assert restored_block == live_block
+		assert hashlib.md5(restored_block).hexdigest() == live_md5
+
+	f_volume.close()
