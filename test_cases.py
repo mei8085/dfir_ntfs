@@ -10,6 +10,8 @@ import datetime
 import uuid
 import re
 import io
+import csv
+import struct
 import gzip
 import tarfile
 import pickle
@@ -5261,3 +5263,318 @@ def test_fat_64bit_sector_count():
 	assert warn_cnt == 1
 
 	FAT.WARN_FUNC = warn_old
+
+# ---------------------------------------------------------------------------
+# WSL/Windows dual-view metadata provenance and precision.
+#
+# LXATTRB and the Windows FRS attributes are independent evidence.  In
+# particular, a Windows owner/security ID is not a Linux UID/GID, and the
+# Linux inode-change timestamp is not another spelling of $SI E.  The tests
+# below retain both the raw source representation and its decoded value.
+# ---------------------------------------------------------------------------
+
+NTFS_PARSER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ntfs_parser')
+WINDOWS_EPOCH_OFFSET_IN_100NS = 116444736000000000
+
+def build_lxattrb_blob(mode = 0o100640, uid = 26501, gid = 5000, rdev = 0x00000811,
+		ns_atime = 123456789, ns_mtime = 234567891, ns_chtime = 345678912,
+		s_atime = 1700000100, s_mtime = 1700000200, s_chtime = 1700000300):
+	"""Build a code-only, valid 56-byte LXATTRB evidence blob."""
+
+	return (
+		struct.pack('<HH', 0, 1) +
+		struct.pack('<IIII', mode, uid, gid, rdev) +
+		struct.pack('<III', ns_atime, ns_mtime, ns_chtime) +
+		struct.pack('<QQQ', s_atime, s_mtime, s_chtime)
+	)
+
+def lxattrb_raw_timestamps(lxattrb_value):
+	"""Return Linux timestamps as (Unix seconds, Unix nanoseconds) pairs."""
+
+	return {
+		'atime': (struct.unpack_from('<Q', lxattrb_value, 32)[0], struct.unpack_from('<I', lxattrb_value, 20)[0]),
+		'mtime': (struct.unpack_from('<Q', lxattrb_value, 40)[0], struct.unpack_from('<I', lxattrb_value, 24)[0]),
+		'chtime': (struct.unpack_from('<Q', lxattrb_value, 48)[0], struct.unpack_from('<I', lxattrb_value, 28)[0])
+	}
+
+def read_linux_metadata_view(lxattrb_value):
+	"""Read the Linux view; invalid evidence raises instead of being defaulted."""
+
+	lxattrb = WSL.LXATTRB(lxattrb_value)
+	return {
+		'source': '$EA/LXATTRB',
+		'timestamp_precision': 'uint64 seconds + uint32 nanoseconds',
+		'mode': lxattrb.get_mode(),
+		'uid': lxattrb.get_uid(),
+		'gid': lxattrb.get_gid(),
+		'rdev': lxattrb.get_rdev(),
+		'atime': lxattrb.get_atime(),
+		'mtime': lxattrb.get_mtime(),
+		'chtime': lxattrb.get_chtime(),
+		'timestamps_raw': lxattrb_raw_timestamps(lxattrb.value)
+	}
+
+def read_optional_linux_metadata_view(lxattrb_value):
+	try:
+		return read_linux_metadata_view(lxattrb_value)
+	except ValueError:
+		return None
+
+def windows_filetime_to_unix_nanoseconds(filetime_value):
+	"""Convert a raw FILETIME tick count to a (seconds, nanoseconds) pair."""
+
+	unix_100ns_ticks = filetime_value - WINDOWS_EPOCH_OFFSET_IN_100NS
+	seconds, remainder_ticks = divmod(unix_100ns_ticks, 10000000)
+	return seconds, remainder_ticks * 100
+
+def read_wsl_windows_frs_views():
+	with open(FRS_EA_WSL, 'rb') as f:
+		frs_raw = f.read()
+
+	frs = MFT.FileRecordSegment(frs_raw)
+	standard_information = None
+	file_name = None
+	lxattrb_value = None
+	ea_entry_count = 0
+
+	for attribute in frs.attributes():
+		if type(attribute) is not MFT.AttributeRecordResident:
+			continue
+
+		attribute_value = attribute.value_decoded()
+
+		if type(attribute_value) is Attributes.StandardInformation:
+			standard_information = attribute_value
+		elif type(attribute_value) is Attributes.FileName:
+			file_name = attribute_value
+		elif type(attribute_value) is Attributes.EA:
+			for ea_name, ea_flags, ea_value in attribute_value.data_parsed():
+				ea_entry_count += 1
+				if ea_name == b'LXATTRB\x00':
+					lxattrb_value = ea_value
+
+	assert standard_information is not None
+	assert file_name is not None
+	assert lxattrb_value is not None
+
+	return frs_raw, standard_information, file_name, lxattrb_value, ea_entry_count
+
+def load_ntfs_parser_namespace():
+	# Stop before the command-line dispatch so process_mft() can be driven
+	# with an in-memory CSV writer and a stubbed $MFT parser.
+	with open(NTFS_PARSER_SCRIPT, 'r', encoding = 'utf-8') as f:
+		parser_source = f.read()
+
+	parser_source = parser_source.split('\nif len(sys.argv)', 1)[0]
+	parser_namespace = { '__name__': 'ntfs_parser_under_test' }
+	exec(compile(parser_source, NTFS_PARSER_SCRIPT, 'exec'), parser_namespace)
+	return parser_namespace
+
+def test_linux_identity_status_and_data_mtime_come_from_lxattrb():
+	lxattrb_blob = build_lxattrb_blob()
+	linux_view = read_linux_metadata_view(lxattrb_blob)
+
+	# Identity and file status are read from LXATTRB fields, not Windows IDs.
+	assert linux_view['uid'] == 26501
+	assert linux_view['gid'] == 5000
+	assert linux_view['mode'] == 0o100640
+	assert linux_view['mode'] & 0o170000 == 0o100000 # Regular file.
+	assert linux_view['mode'] & 0o7777 == 0o640
+	assert linux_view['rdev'] == 0x00000811
+
+	# The raw nanosecond field is the authoritative precision-preserving form.
+	assert linux_view['timestamps_raw']['mtime'] == (1700000200, 234567891)
+	assert linux_view['timestamps_raw']['atime'] == (1700000100, 123456789)
+	assert linux_view['timestamps_raw']['chtime'] == (1700000300, 345678912)
+
+	# datetime preserves only microseconds and rounds the remaining nanoseconds.
+	assert linux_view['mtime'] == datetime.datetime(2023, 11, 14, 22, 16, 40, 234568)
+	assert linux_view['atime'] == datetime.datetime(2023, 11, 14, 22, 15, 0, 123457)
+	assert linux_view['chtime'] == datetime.datetime(2023, 11, 14, 22, 18, 20, 345679)
+
+	# A real evidence sample has the same independent identity/time layout.
+	with open(LXATTRB_WSL_2, 'rb') as f:
+		real_blob = f.read()
+
+	real_lxattrb = WSL.LXATTRB(real_blob)
+	assert real_lxattrb.get_uid() == 1000
+	assert real_lxattrb.get_gid() == 114
+	assert real_lxattrb.get_mode() == 0o100644
+	assert real_lxattrb.get_rdev() == 0
+	assert lxattrb_raw_timestamps(real_blob)['mtime'] == (1547669488, 37288400)
+	assert real_lxattrb.get_mtime() == datetime.datetime(2019, 1, 16, 20, 11, 28, 37288)
+
+def test_dual_wsl_and_windows_views_keep_sources_precision_and_events():
+	frs_raw, si, fn, lxattrb_value, ea_entry_count = read_wsl_windows_frs_views()
+	lxattrb = WSL.LXATTRB(lxattrb_value)
+	linux_raw = lxattrb_raw_timestamps(lxattrb_value)
+
+	assert ea_entry_count == 2 # LXATTRB and LXXATTR remain separate evidence entries.
+
+	# Windows identity evidence and Linux identity evidence occupy different ID domains.
+	assert si.get_owner_id() == 0
+	assert si.get_security_id() == 3974
+	assert lxattrb.get_uid() == 0
+	assert lxattrb.get_gid() == 0
+	assert lxattrb.get_mode() == 0o100644
+
+	# Numeric equality between the Windows owner ID and Linux UID does not merge them.
+	assert si.get_owner_id() == lxattrb.get_uid() == 0
+	assert si.get_security_id() != lxattrb.get_uid()
+
+	si_mtime_raw = struct.unpack_from('<Q', si.value, 8)[0]
+	si_etime_raw = struct.unpack_from('<Q', si.value, 16)[0]
+	fn_mtime_raw = struct.unpack_from('<Q', fn.value, 8)[0]
+
+	assert si_mtime_raw == fn_mtime_raw == 131925744720564428
+	assert si_etime_raw == 131925746817436151
+
+	# Windows FILETIME is a 64-bit count of 100 ns intervals since 1601.
+	windows_mtime_pair = windows_filetime_to_unix_nanoseconds(si_mtime_raw)
+	windows_etime_pair = windows_filetime_to_unix_nanoseconds(si_etime_raw)
+	assert windows_mtime_pair == (1548100872, 56442800)
+	assert windows_etime_pair == (1548101081, 743615100)
+	assert windows_mtime_pair[1] % 100 == 0
+
+	# In this FRS the Windows M/A event and Linux M/A field record the same instant.
+	# Their source encodings remain different and are asserted separately.
+	assert linux_raw['mtime'] == windows_mtime_pair
+	assert linux_raw['atime'] == windows_filetime_to_unix_nanoseconds(
+		struct.unpack_from('<Q', si.value, 24)[0])
+
+	# Linux CH and Windows E are metadata-change records, but they are not the same event here.
+	assert linux_raw['chtime'] == (1548103955, 776983900)
+	assert linux_raw['chtime'] != windows_etime_pair
+
+	# Python datetime is only a microsecond projection.  The raw pairs above are
+	# authoritative; in particular, float conversion makes these M/A strings differ
+	# by one microsecond even though the raw evidence describes the same instant.
+	assert si.get_mtime() == datetime.datetime(2019, 1, 21, 20, 1, 12, 56442)
+	assert si.get_atime() == datetime.datetime(2019, 1, 21, 20, 1, 12, 56442)
+	assert si.get_ctime() == datetime.datetime(2019, 1, 21, 20, 1, 12, 56442)
+	assert si.get_etime() == datetime.datetime(2019, 1, 21, 20, 4, 41, 743616)
+
+	assert fn.get_mtime() == datetime.datetime(2019, 1, 21, 20, 1, 12, 56442)
+	assert fn.get_atime() == datetime.datetime(2019, 1, 21, 20, 1, 12, 56442)
+	assert fn.get_ctime() == datetime.datetime(2019, 1, 21, 20, 1, 12, 56442)
+	assert fn.get_etime() == datetime.datetime(2019, 1, 21, 20, 1, 12, 56442)
+
+	assert lxattrb.get_mtime() == datetime.datetime(2019, 1, 21, 20, 1, 12, 56443)
+	assert lxattrb.get_atime() == datetime.datetime(2019, 1, 21, 20, 1, 12, 56443)
+	assert lxattrb.get_chtime() == datetime.datetime(2019, 1, 21, 20, 52, 35, 776984)
+
+	# LXATTRB has no birth/creation timestamp; Windows C must not be copied into it.
+	assert set(linux_raw.keys()) == { 'atime', 'mtime', 'chtime' }
+
+def test_invalid_lxattrb_and_lxxattr_do_not_create_linux_evidence():
+	valid_blob = build_lxattrb_blob()
+	assert read_optional_linux_metadata_view(valid_blob) is not None
+
+	invalid_blobs = [
+		b'',
+		b'\x00' * 56, # Version is zero.
+		valid_blob[:-1],
+		valid_blob + b'\x00',
+		struct.pack('<HH', 1, 1) + valid_blob[4:], # Unsupported format.
+		struct.pack('<HH', 0, 2) + valid_blob[4:]  # Unsupported version.
+	]
+
+	for invalid_blob in invalid_blobs:
+		with pytest.raises(ValueError):
+			WSL.LXATTRB(invalid_blob)
+
+		# No default UID/GID/mode/timestamp view may be synthesized for bad evidence.
+		assert read_optional_linux_metadata_view(invalid_blob) is None
+
+	invalid_lxxattr_blobs = [
+		b'',
+		b'\x00' * 11,
+		struct.pack('<HH', 1, 1) + b'\x00' * 8,
+		struct.pack('<HH', 0, 2) + b'\x00' * 8
+	]
+
+	for invalid_blob in invalid_lxxattr_blobs:
+		with pytest.raises(ValueError):
+			WSL.LXXATTR(invalid_blob)
+
+	# In a real dual-view FRS, rejecting the corrupt Linux evidence must not
+	# cause the Windows owner/security IDs to be promoted to Linux UID/GID.
+	_frs_raw, windows_si, _file_name, frs_lxattrb_value, _ea_count = read_wsl_windows_frs_views()
+	corrupt_lxattrb_value = bytearray(frs_lxattrb_value)
+	corrupt_lxattrb_value[2] = 2
+	assert read_optional_linux_metadata_view(bytes(corrupt_lxattrb_value)) is None
+	assert windows_si.get_owner_id() == 0
+	assert windows_si.get_security_id() == 3974
+
+def test_parser_invalid_wsl_ea_leaves_windows_csv_view_unchanged(monkeypatch):
+	raw_good, _si, _fn, _lxattrb_value, _ea_count = read_wsl_windows_frs_views()
+
+	# The LXATTRB value starts at FRS offset 444; corrupt only its version field.
+	lxattrb_signature = b'\x00\x00\x01\x00\xa4\x81\x00\x00'
+	lxattrb_offset = raw_good.find(lxattrb_signature)
+	assert lxattrb_offset == 444
+
+	raw_bad = bytearray(raw_good)
+	raw_bad[lxattrb_offset + 2] = 2
+
+	record_holder = { 'raw': raw_good }
+	class SingleRecordMFTParser(object):
+		def __init__(self, file_object, do_first_pass = True):
+			self.file_record = MFT.FileRecord(MFT.FileRecordSegment(record_holder['raw']), [])
+
+		def file_records(self):
+			return [ self.file_record ]
+
+		def build_full_paths(self, file_record, strict = False):
+			return []
+
+		def get_file_record_by_number(self, *args, **kwargs):
+			raise MFT.MasterFileTableException('Parent MFT record is not part of this unit test')
+
+	monkeypatch.setattr(MFT, 'MasterFileTableParser', SingleRecordMFTParser)
+	parser_namespace = load_ntfs_parser_namespace()
+
+	def run_process_mft(raw):
+		record_holder['raw'] = raw
+		output_buffer = io.StringIO()
+		parser_namespace['input_file'] = io.BytesIO(b'The MFT parser itself is stubbed')
+		parser_namespace['csv_writer'] = csv.writer(output_buffer)
+		parser_namespace['print_header'] = True
+		parser_namespace['process_mft']()
+		return list(csv.reader(io.StringIO(output_buffer.getvalue())))
+
+	good_rows = run_process_mft(raw_good)
+	bad_rows = run_process_mft(bytes(raw_bad))
+
+	assert len(good_rows) == len(bad_rows) == 2
+	header, good_row = good_rows
+	bad_header, bad_row = bad_rows
+	assert header == bad_header
+	assert len(header) == len(good_row) == len(bad_row) == 21
+
+	assert header[6 : 11] == [
+		'$SI M timestamp', '$SI A timestamp', '$SI C timestamp',
+		'$SI E timestamp', '$SI USN value'
+	]
+	assert header[18 : 21] == [ 'WSL M timestamp', 'WSL A timestamp', 'WSL CH timestamp' ]
+
+	expected_windows_si = [
+		'2019-01-21 20:01:12.056442',
+		'2019-01-21 20:01:12.056442',
+		'2019-01-21 20:01:12.056442',
+		'2019-01-21 20:04:41.743616',
+		'1170214456'
+	]
+	assert good_row[6 : 11] == expected_windows_si
+	assert bad_row[6 : 11] == expected_windows_si
+
+	# Every non-WSL column, including all Windows views, is unchanged.
+	assert bad_row[:18] == good_row[:18]
+
+	# Valid Linux evidence is reported; invalid evidence produces blanks, not fallback values.
+	assert good_row[18 : 21] == [
+		'2019-01-21 20:01:12.056443',
+		'2019-01-21 20:01:12.056443',
+		'2019-01-21 20:52:35.776984'
+	]
+	assert bad_row[18 : 21] == [ '', '', '' ]
